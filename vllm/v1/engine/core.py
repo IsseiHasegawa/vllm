@@ -83,6 +83,7 @@ from vllm.v1.outputs import ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus
 from vllm.v1.serial_utils import MsgpackDecoder, MsgpackEncoder
 from vllm.v1.structured_output import StructuredOutputManager
+import vllm.phase_logger as phase_logger  # PHASE-INSTR
 from vllm.v1.utils import IterationDetails, compute_iteration_details
 from vllm.version import __version__ as VLLM_VERSION
 
@@ -221,6 +222,13 @@ class EngineCore:
         self.step_fn = (
             self.step if self.batch_queue is None else self.step_with_batch_queue
         )
+        if phase_logger.ENABLED and self.batch_queue is not None:  # PHASE-INSTR
+            logger.warning(
+                "PHASE-INSTR: batch-queue/async-scheduling step path is active; "
+                "step-level records (steps-*.jsonl) will NOT be written. "
+                "Per-request records are unaffected. Disable async scheduling / "
+                "pipeline parallelism for step-level instrumentation."
+            )
         self.async_scheduling = vllm_config.scheduler_config.async_scheduling
 
         self.aborts_queue = queue.Queue[list[str]]()
@@ -487,7 +495,9 @@ class EngineCore:
         # or finished and not yet removed from the batch.
         if not self.scheduler.has_requests():
             return {}, False
+        _pi_t0 = time.perf_counter()  # PHASE-INSTR
         scheduler_output = self.scheduler.schedule(self._should_throttle_prefills())
+        _pi_t1 = time.perf_counter()  # PHASE-INSTR
         future = self.model_executor.execute_model(scheduler_output, non_block=True)
         grammar_output = self.scheduler.get_grammar_bitmask(scheduler_output)
         with (
@@ -497,6 +507,34 @@ class EngineCore:
             model_output = future.result()
             if model_output is None:
                 model_output = self.model_executor.sample_tokens(grammar_output)
+
+        if (  # PHASE-INSTR
+            phase_logger.ENABLED
+            and scheduler_output.total_num_scheduled_tokens > 0
+        ):
+            _pi_t2 = time.perf_counter()
+            _pi_d = compute_iteration_details(scheduler_output)
+            _pi_kv = getattr(
+                getattr(self.scheduler, "kv_cache_manager", None), "usage", -1.0
+            )
+            phase_logger.log(
+                "steps",
+                {
+                    "ts": time.time(),
+                    # CPU time spent in the scheduler for this step.
+                    "sched_s": _pi_t1 - _pi_t0,
+                    # Wall time from schedule-done to model output ready
+                    # (GPU execution, overlapped with grammar bitmask prep).
+                    "exec_s": _pi_t2 - _pi_t1,
+                    "n_ctx_reqs": _pi_d.num_ctx_requests,
+                    "n_ctx_toks": _pi_d.num_ctx_tokens,
+                    "n_gen_reqs": _pi_d.num_generation_requests,
+                    "n_gen_toks": _pi_d.num_generation_tokens,
+                    "n_running": len(self.scheduler.running),
+                    "n_waiting": len(self.scheduler.waiting),
+                    "kv_usage": _pi_kv,
+                },
+            )
 
         # Before processing the model output, process any aborts that happened
         # during the model execution.

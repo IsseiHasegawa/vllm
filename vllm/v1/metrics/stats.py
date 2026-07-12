@@ -7,6 +7,7 @@ from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any
 
 import vllm.envs as envs
+import vllm.phase_logger as phase_logger  # PHASE-INSTR
 from vllm.compilation.cuda_graph import CUDAGraphStat
 from vllm.v1.metrics.perf import PerfStats
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
@@ -474,6 +475,26 @@ class IterationStats:
             num_cached_tokens=num_cached_tokens,
         )
         self.finished_requests.append(finished_req)
+
+        if phase_logger.ENABLED:  # PHASE-INSTR
+            phase_logger.log(
+                "requests",
+                {
+                    "ts": time.time(),
+                    "req_id": request_id,
+                    "arrival_ts": req_stats.arrival_time,
+                    "n_prompt": num_prompt_tokens,
+                    "n_gen": req_stats.num_generation_tokens,
+                    "n_cached": num_cached_tokens,
+                    "queued_s": queued_time,
+                    "prefill_s": prefill_time,
+                    "decode_s": decode_time,
+                    "inference_s": inference_time,
+                    "e2e_s": e2e_latency,
+                    "mean_tpot_s": mean_time_per_output_token,
+                    "finish": str(finish_reason),
+                },
+            )
 
         # Count corrupted requests when they finish (only once per request)
         if req_stats.is_corrupted:
