@@ -17,7 +17,9 @@ Design constraints:
     * stdlib only, no imports from vllm (no circular-import risk).
     * Never raises into the caller: instrumentation must not break serving.
     * Buffered (flush every _FLUSH_EVERY records) to keep per-call cost
-      in the microsecond range; explicit flush on interpreter exit.
+      in the microsecond range; a daemon thread additionally flushes every
+      _FLUSH_SECS seconds, so abrupt termination (SIGTERM/SIGKILL without
+      atexit, as observed for EngineCore) loses at most ~1s of records.
     * Fork-aware: if the pid changes, a fresh file is opened.
 
 Run attribution is NOT handled here by design: the server outlives
@@ -38,6 +40,9 @@ _LOG_DIR: str = os.environ.get("VLLM_PHASE_LOG_DIR", "")
 ENABLED: bool = bool(_LOG_DIR)
 
 _FLUSH_EVERY = 200
+# A daemon thread flushes every _FLUSH_SECS so that abrupt termination
+# (kill without atexit) loses at most about one second of records.
+_FLUSH_SECS = 1.0
 
 _lock = threading.Lock()
 # kind -> {"fh": file, "pid": int, "seq": int, "buf": list[str]}
@@ -45,6 +50,7 @@ _state: dict = {}
 
 
 def _open(kind: str) -> dict:
+    _ensure_flusher()
     os.makedirs(_LOG_DIR, exist_ok=True)
     pid = os.getpid()
     path = os.path.join(_LOG_DIR, f"{kind}-{pid}.jsonl")
@@ -80,6 +86,25 @@ def _flush_all() -> None:
 
 
 atexit.register(_flush_all)
+
+_flusher_pid = None
+
+
+def _flush_loop() -> None:
+    while True:
+        time.sleep(_FLUSH_SECS)
+        _flush_all()
+
+
+def _ensure_flusher() -> None:
+    """Start (or restart after fork) the periodic flusher thread."""
+    global _flusher_pid
+    if _flusher_pid == os.getpid():
+        return
+    _flusher_pid = os.getpid()
+    threading.Thread(
+        target=_flush_loop, name="phase-logger-flush", daemon=True
+    ).start()
 
 
 def log(kind: str, record: dict) -> None:
